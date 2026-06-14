@@ -128,6 +128,8 @@ async def garantir_canteiro():
             )
 
 async def inserir_leitura(leitura: dict):
+    if not db_pool:
+        return
     dt = datetime.strptime(leitura["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
@@ -175,14 +177,22 @@ async def emulador_horta_loop():
 @app.on_event("startup")
 async def startup_event():
     global db_pool
-    db_pool = await criar_pool()
-    await garantir_canteiro()
+    if DB_CONFIG["host"] and DB_CONFIG["password"]:
+        try:
+            db_pool = await criar_pool()
+            await garantir_canteiro()
+            print("INFO: Banco de dados conectado.")
+        except Exception as e:
+            print(f"WARNING: Banco indisponível, rodando só em memória. ({e})")
+    else:
+        print("INFO: Variáveis de banco não configuradas, rodando só em memória.")
     asyncio.create_task(emulador_horta_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    db_pool.close()
-    await db_pool.wait_closed()
+    if db_pool:
+        db_pool.close()
+        await db_pool.wait_closed()
 
 # -------------------------------------------------------
 # ENDPOINTS (sem alteração)
