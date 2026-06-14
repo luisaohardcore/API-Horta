@@ -161,13 +161,13 @@ async def inserir_leitura(leitura: dict):
 # -------------------------------------------------------
 async def emulador_horta_loop():
     if not BANCO_FICTICIO:
-        leitura = gerar_leitura_ficticia(datetime.now())
+        leitura = gerar_leitura_ficticia(datetime.utcnow())
         BANCO_FICTICIO.append(leitura)
         await inserir_leitura(leitura)
 
     while True:
         await asyncio.sleep(60)
-        leitura = gerar_leitura_ficticia(datetime.now())
+        leitura = gerar_leitura_ficticia(datetime.utcnow())
         BANCO_FICTICIO.append(leitura)
         await inserir_leitura(leitura)
 
