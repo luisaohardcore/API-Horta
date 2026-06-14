@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import random
 import asyncio
@@ -9,6 +9,8 @@ import ssl
 import os
 
 load_dotenv()
+
+FUSO_BR = timezone(timedelta(hours=-3))
 
 app = FastAPI(title="HortaSmart API - Simulação Pura")
 
@@ -161,13 +163,13 @@ async def inserir_leitura(leitura: dict):
 # -------------------------------------------------------
 async def emulador_horta_loop():
     if not BANCO_FICTICIO:
-        leitura = gerar_leitura_ficticia(datetime.utcnow())
+        leitura = gerar_leitura_ficticia(datetime.now(FUSO_BR).replace(tzinfo=None))
         BANCO_FICTICIO.append(leitura)
         await inserir_leitura(leitura)
 
     while True:
         await asyncio.sleep(60)
-        leitura = gerar_leitura_ficticia(datetime.utcnow())
+        leitura = gerar_leitura_ficticia(datetime.now(FUSO_BR).replace(tzinfo=None))
         BANCO_FICTICIO.append(leitura)
         await inserir_leitura(leitura)
 
