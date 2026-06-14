@@ -107,9 +107,12 @@ def gerar_leitura_ficticia(dt: datetime):
 # PERSISTÊNCIA
 # -------------------------------------------------------
 async def criar_pool():
-    ssl_ctx = None
     if SSL_CA:
         ssl_ctx = ssl.create_default_context(cafile=SSL_CA)
+    else:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
 
     return await aiomysql.create_pool(
         **DB_CONFIG,
