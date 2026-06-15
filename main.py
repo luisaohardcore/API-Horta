@@ -421,3 +421,89 @@ async def resolver_alerta(alerta_id: int):
                 "UPDATE alertas SET resolvido = 1 WHERE id = %s", (alerta_id,)
             )
     return {"id": alerta_id, "resolvido": True}
+
+# -------------------------------------------------------
+# SEED — geração de histórico mockado
+# -------------------------------------------------------
+@app.post("/api/v1/seed")
+async def seed_historico(dias: int = 10):
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Banco indisponível")
+
+    agora     = datetime.now(FUSO_BR).replace(tzinfo=None)
+    inicio    = agora - timedelta(days=dias)
+    total_min = dias * 24 * 60
+
+    leituras_batch = []
+    alertas_batch  = []
+
+    for canteiro in CANTEIROS:
+        cid = canteiro["id"]
+        # Estado temporário para não interferir na simulação live
+        estado_temp = {"historico": [], "bomba_ativa": False, "leituras_bomba": 0}
+        estado_bkp  = estado[cid].copy()
+
+        # Substitui estado temporariamente
+        estado[cid] = estado_temp
+
+        for i in range(total_min):
+            dt      = inicio + timedelta(minutes=i)
+            leitura = gerar_leitura(cid, dt)
+            estado_temp["historico"] = [leitura]  # mantém só o último para passo_suave
+
+            leituras_batch.append((
+                dt, cid,
+                leitura["umidade"], leitura["umidade_solo"],
+                leitura["temperatura"], leitura["temperatura_solo"],
+                leitura["PH_solo"], leitura["luminosidade"],
+                int(leitura["status_bomba"]),
+            ))
+
+            # Verifica thresholds para alertas
+            for campo, limites in LIMITES.items():
+                valor = leitura[campo if campo != "ph_solo" else "PH_solo"]
+                if "max" in limites and valor > limites["max"]:
+                    alertas_batch.append((dt, cid, campo, valor, limites["severidade"],
+                                          f"{campo} acima do limite: {valor}", 0))
+                if "min" in limites and valor < limites["min"]:
+                    alertas_batch.append((dt, cid, campo, valor, limites["severidade"],
+                                          f"{campo} abaixo do limite: {valor}", 0))
+
+            if estado[cid]["bomba_ativa"]:
+                estado[cid]["leituras_bomba"] += 1
+                if estado[cid]["leituras_bomba"] > 10:
+                    alertas_batch.append((dt, cid, "status_bomba", 1, "CRITICAL",
+                                          "Bomba ativa por mais de 10 leituras sem recuperar umidade", 0))
+            else:
+                estado[cid]["leituras_bomba"] = 0
+
+        # Restaura estado live
+        estado[cid] = estado_bkp
+
+    # Batch insert leituras
+    BATCH = 500
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            for i in range(0, len(leituras_batch), BATCH):
+                await cur.executemany(
+                    """INSERT IGNORE INTO leituras
+                        (timestamp, canteiro_id, umidade, umidade_solo,
+                         temperatura, temperatura_solo, ph_solo, luminosidade, status_bomba)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    leituras_batch[i:i+BATCH]
+                )
+            for i in range(0, len(alertas_batch), BATCH):
+                await cur.executemany(
+                    """INSERT IGNORE INTO alertas
+                        (timestamp, canteiro_id, campo, valor, severidade, mensagem, resolvido)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    alertas_batch[i:i+BATCH]
+                )
+            await conn.commit()
+
+    return {
+        "leituras_inseridas": len(leituras_batch),
+        "alertas_inseridos":  len(alertas_batch),
+        "canteiros":          len(CANTEIROS),
+        "periodo_dias":       dias,
+    }
