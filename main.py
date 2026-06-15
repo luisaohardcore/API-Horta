@@ -1,18 +1,18 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import random
 import asyncio
 import aiomysql
 import ssl
+import math
 import os
 
 load_dotenv()
 
-FUSO_BR = timezone(timedelta(hours=-3))
-
-app = FastAPI(title="HortaSmart API - Simulação Pura")
+app = FastAPI(title="HortaSmart API - Simulação Multi-Canteiro")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +21,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+FUSO_BR = timezone(timedelta(hours=-3))
 
 # -------------------------------------------------------
 # CONFIG DB
@@ -34,66 +36,129 @@ DB_CONFIG = {
 }
 SSL_CA = os.getenv("DB_SSL_CA")
 
-CANTEIRO_ID   = 1
-CANTEIRO_NOME = "Principal"
-
 db_pool = None
 
 # -------------------------------------------------------
-# LÓGICA DE SIMULAÇÃO (sem alteração)
+# CANTEIROS
 # -------------------------------------------------------
-BANCO_FICTICIO = []
-bomba_ativa    = False
+CANTEIROS = [
+    {"id": 1, "nome": "Canteiro A"},
+    {"id": 2, "nome": "Canteiro B"},
+    {"id": 3, "nome": "Canteiro C"},
+]
 
-def calcular_proximo_valor(valor_atual, limite_min, limite_max, passo_max=0.5):
-    direcao  = random.choice([-1, 0, 1])
-    variacao = direcao * random.uniform(0.0, passo_max)
-    return max(limite_min, min(limite_max, round(valor_atual + variacao, 2)))
+estado = {
+    c["id"]: {"historico": [], "bomba_ativa": False}
+    for c in CANTEIROS
+}
 
-def gerar_leitura_ficticia(dt: datetime):
-    global bomba_ativa
-    hour = dt.hour
+# -------------------------------------------------------
+# LÓGICA DE SIMULAÇÃO
+# -------------------------------------------------------
+def base_temperatura(hora_decimal: float) -> float:
+    """Ciclo diário: pico às 14h (32°C), vale às 5h (18°C)."""
+    angulo = (hora_decimal - 9.5) * math.pi / 9
+    return 25.0 + 7.0 * math.sin(angulo)
 
-    if not BANCO_FICTICIO:
-        if 8 <= hour <= 18:
-            temp_base, hum_ar_base, hum_solo_base, temp_solo_base = 26.0, 45.0, 65.0, 23.0
-        else:
-            temp_base, hum_ar_base, hum_solo_base, temp_solo_base = 20.0, 72.0, 65.0, 19.0
-        ph_base = 6.5
+def base_temperatura_solo(hora_decimal: float) -> float:
+    """Solo: lag de 2h em relação ao ar, amplitude menor."""
+    angulo = (hora_decimal - 11.5) * math.pi / 9
+    return 22.0 + 4.5 * math.sin(angulo)
+
+def base_umidade_ar(temp_ar: float) -> float:
+    """Umidade do ar inversamente proporcional à temperatura."""
+    return max(35.0, min(90.0, 85.0 - (temp_ar - 18.0) * 3.0))
+
+def taxa_evaporacao(temp_ar: float, hum_ar: float) -> float:
+    """Perda de umidade do solo por minuto. Maior quando quente e ar seco."""
+    fator_temp = (temp_ar - 18.0) / 17.0
+    fator_ar   = (100.0 - hum_ar) / 65.0
+    return max(0.05, min(0.5, fator_temp * 0.3 + fator_ar * 0.2))
+
+def luminosidade_por_hora(hora: int, temp_ar: float) -> float:
+    """Lux baseado na hora. Correlação leve com temperatura."""
+    if not (6 <= hora <= 18):
+        return round(random.uniform(0.0, 15.0), 1)
+
+    if 11 <= hora <= 14:
+        lux = random.uniform(8000.0, 12000.0)
+    elif 8 <= hora <= 17:
+        lux = random.uniform(3000.0, 8000.0)
     else:
-        ultimo        = BANCO_FICTICIO[-1]
-        temp_base     = ultimo["temperatura"]
-        hum_ar_base   = ultimo["umidade"]
-        hum_solo_base = ultimo["umidade_solo"]
-        temp_solo_base= ultimo["temperatura_solo"]
-        ph_base       = ultimo["PH_solo"]
+        lux = random.uniform(500.0, 3000.0)
 
-    temp      = calcular_proximo_valor(temp_base,      15.0, 35.0, 0.5)
-    temp_solo = calcular_proximo_valor(temp_solo_base, 14.0, 30.0, 0.2)
-    hum_ar    = calcular_proximo_valor(hum_ar_base,    30.0, 95.0, 0.5)
-    ph_solo   = calcular_proximo_valor(ph_base,         5.5,  7.5, 0.02)
+    fator_temp = 0.85 + 0.15 * (temp_ar - 18.0) / 14.0
+    return round(max(0.0, min(12000.0, lux * fator_temp)), 1)
 
-    if bomba_ativa:
-        hum_solo = round(hum_solo_base + random.uniform(0.5, 1.5), 1)
+def passo_suave(atual, alvo, passo_max=0.5, ruido=0.05, mn=None, mx=None):
+    """Move 'atual' em direção a 'alvo' com passo máximo + pequeno ruído."""
+    delta    = alvo - atual
+    movimento = max(-passo_max, min(passo_max, delta))
+    valor    = atual + movimento + random.uniform(-ruido, ruido)
+    if mn is not None: valor = max(mn, valor)
+    if mx is not None: valor = min(mx, valor)
+    return round(valor, 2)
+
+def gerar_leitura(canteiro_id: int, dt: datetime) -> dict:
+    s    = estado[canteiro_id]
+    hist = s["historico"]
+    hora = dt.hour + dt.minute / 60.0
+
+    ultimo = hist[-1] if hist else None
+
+    # Temperatura do ar: move suavemente em direção à base sinusoidal
+    temp = passo_suave(
+        atual=ultimo["temperatura"] if ultimo else base_temperatura(hora),
+        alvo=base_temperatura(hora),
+        passo_max=0.5, ruido=0.05, mn=15.0, mx=35.0
+    )
+
+    # Temperatura do solo: lag de 2h, passo menor
+    temp_solo = passo_suave(
+        atual=ultimo["temperatura_solo"] if ultimo else base_temperatura_solo(hora),
+        alvo=base_temperatura_solo(hora),
+        passo_max=0.3, ruido=0.03, mn=14.0, mx=30.0
+    )
+
+    # Umidade do ar: move em direção à base (inversa da temp)
+    hum_ar = passo_suave(
+        atual=ultimo["umidade"] if ultimo else base_umidade_ar(temp),
+        alvo=base_umidade_ar(temp),
+        passo_max=0.5, ruido=0.05, mn=30.0, mx=95.0
+    )
+
+    # pH do solo: quase estático
+    ph_solo = passo_suave(
+        atual=ultimo["PH_solo"] if ultimo else 6.5,
+        alvo=6.5,
+        passo_max=0.01, ruido=0.005, mn=5.5, mx=7.5
+    )
+
+    # Umidade do solo: evaporação ou irrigação
+    hum_solo_ant = ultimo["umidade_solo"] if ultimo else 65.0
+
+    if s["bomba_ativa"]:
+        # Umidade sobe mais rápido com irrigação
+        hum_solo = round(min(90.0, hum_solo_ant + random.uniform(0.8, 1.5)), 1)
         if hum_solo >= 78.0:
-            bomba_ativa = False
-    else:
-        hum_solo = calcular_proximo_valor(hum_solo_base, 40.0, 90.0, 0.5)
-        if hum_solo <= 55.0:
-            bomba_ativa = True
-
-    if 6 <= hour <= 18:
-        fator_solar  = random.uniform(0.85, 1.0)
-        luminosidade = (
-            round(random.uniform(9000.0, 12000.0) * fator_solar, 1)
-            if 11 <= hour <= 14
-            else round(random.uniform(2000.0,  5000.0) * fator_solar, 1)
+            s["bomba_ativa"] = False
+        # Temperatura do solo cai por resfriamento evaporativo
+        temp_solo = passo_suave(
+            atual=temp_solo,
+            alvo=temp_solo - random.uniform(0.3, 0.8),
+            passo_max=0.5, ruido=0.02, mn=14.0, mx=30.0
         )
     else:
-        luminosidade = round(random.uniform(0.0, 15.0), 1)
+        evap     = taxa_evaporacao(temp, hum_ar)
+        hum_solo = round(max(40.0, hum_solo_ant - evap + random.uniform(-0.05, 0.05)), 1)
+        if hum_solo <= 55.0:
+            s["bomba_ativa"] = True
+
+    luminosidade = luminosidade_por_hora(dt.hour, temp)
 
     return {
-        "id":               len(BANCO_FICTICIO) + 1,
+        "id":               len(hist) + 1,
+        "canteiro_id":      canteiro_id,
         "timestamp":        dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "umidade":          hum_ar,
         "umidade_solo":     hum_solo,
@@ -101,7 +166,7 @@ def gerar_leitura_ficticia(dt: datetime):
         "temperatura_solo": temp_solo,
         "luminosidade":     luminosidade,
         "PH_solo":          ph_solo,
-        "status_bomba":     bomba_ativa,
+        "status_bomba":     s["bomba_ativa"],
         "status":           "ok",
     }
 
@@ -114,7 +179,7 @@ async def criar_pool():
     else:
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
 
     return await aiomysql.create_pool(
         **DB_CONFIG,
@@ -124,13 +189,14 @@ async def criar_pool():
         maxsize=5,
     )
 
-async def garantir_canteiro():
+async def garantir_canteiros():
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "INSERT IGNORE INTO canteiros (id, nome) VALUES (%s, %s)",
-                (CANTEIRO_ID, CANTEIRO_NOME),
-            )
+            for c in CANTEIROS:
+                await cur.execute(
+                    "INSERT IGNORE INTO canteiros (id, nome) VALUES (%s, %s)",
+                    (c["id"], c["nome"]),
+                )
 
 async def inserir_leitura(leitura: dict):
     if not db_pool:
@@ -147,7 +213,7 @@ async def inserir_leitura(leitura: dict):
                 """,
                 (
                     dt,
-                    CANTEIRO_ID,
+                    leitura["canteiro_id"],
                     leitura["umidade"],
                     leitura["umidade_solo"],
                     leitura["temperatura"],
@@ -159,22 +225,21 @@ async def inserir_leitura(leitura: dict):
             )
 
 # -------------------------------------------------------
-# LOOP DO EMULADOR
+# LOOP POR CANTEIRO
 # -------------------------------------------------------
-async def emulador_horta_loop():
-    if not BANCO_FICTICIO:
-        leitura = gerar_leitura_ficticia(datetime.now(FUSO_BR).replace(tzinfo=None))
-        BANCO_FICTICIO.append(leitura)
-        await inserir_leitura(leitura)
+async def emulador_canteiro(canteiro_id: int):
+    leitura = gerar_leitura(canteiro_id, datetime.now(FUSO_BR).replace(tzinfo=None))
+    estado[canteiro_id]["historico"].append(leitura)
+    await inserir_leitura(leitura)
 
     while True:
         await asyncio.sleep(60)
-        leitura = gerar_leitura_ficticia(datetime.now(FUSO_BR).replace(tzinfo=None))
-        BANCO_FICTICIO.append(leitura)
+        leitura = gerar_leitura(canteiro_id, datetime.now(FUSO_BR).replace(tzinfo=None))
+        hist    = estado[canteiro_id]["historico"]
+        hist.append(leitura)
         await inserir_leitura(leitura)
-
-        if len(BANCO_FICTICIO) > 1000:
-            BANCO_FICTICIO.pop(0)
+        if len(hist) > 1000:
+            hist.pop(0)
 
 # -------------------------------------------------------
 # STARTUP / SHUTDOWN
@@ -185,13 +250,15 @@ async def startup_event():
     if DB_CONFIG["host"] and DB_CONFIG["password"]:
         try:
             db_pool = await criar_pool()
-            await garantir_canteiro()
+            await garantir_canteiros()
             print("INFO: Banco de dados conectado.")
         except Exception as e:
             print(f"WARNING: Banco indisponível, rodando só em memória. ({e})")
     else:
         print("INFO: Variáveis de banco não configuradas, rodando só em memória.")
-    asyncio.create_task(emulador_horta_loop())
+
+    for c in CANTEIROS:
+        asyncio.create_task(emulador_canteiro(c["id"]))
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -200,14 +267,63 @@ async def shutdown_event():
         await db_pool.wait_closed()
 
 # -------------------------------------------------------
-# ENDPOINTS (sem alteração)
+# ENDPOINTS
 # -------------------------------------------------------
-@app.get("/api/v1/telemetria/atual")
-def obter_leitura_atual():
-    if BANCO_FICTICIO:
-        return BANCO_FICTICIO[-1]
-    return {"erro": "Aguardando primeira leitura do sensor..."}
+class CanteiroCriar(BaseModel):
+    nome: str
 
-@app.get("/api/v1/telemetria/historico")
-def obter_historico():
-    return BANCO_FICTICIO
+@app.post("/api/v1/canteiros", status_code=201)
+async def criar_canteiro(body: CanteiroCriar):
+    novo_id  = max(c["id"] for c in CANTEIROS) + 1
+    canteiro = {"id": novo_id, "nome": body.nome}
+
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO canteiros (id, nome) VALUES (%s, %s)",
+                    (novo_id, body.nome),
+                )
+
+    CANTEIROS.append(canteiro)
+    estado[novo_id] = {"historico": [], "bomba_ativa": False}
+    asyncio.create_task(emulador_canteiro(novo_id))
+    return canteiro
+
+
+class BombaEstado(BaseModel):
+    ativa: bool
+
+@app.patch("/api/v1/canteiros/{canteiro_id}/bomba")
+def controlar_bomba(canteiro_id: int, body: BombaEstado):
+    if canteiro_id not in estado:
+        raise HTTPException(status_code=404, detail="Canteiro não encontrado")
+    estado[canteiro_id]["bomba_ativa"] = body.ativa
+    return {"canteiro_id": canteiro_id, "bomba_ativa": body.ativa}
+
+@app.get("/api/v1/canteiros")
+def listar_canteiros():
+    return CANTEIROS
+
+@app.get("/api/v1/telemetria/atual")
+def leitura_atual_todos():
+    return {
+        c["id"]: estado[c["id"]]["historico"][-1]
+        if estado[c["id"]]["historico"] else None
+        for c in CANTEIROS
+    }
+
+@app.get("/api/v1/telemetria/atual/{canteiro_id}")
+def leitura_atual(canteiro_id: int):
+    if canteiro_id not in estado:
+        raise HTTPException(status_code=404, detail="Canteiro não encontrado")
+    hist = estado[canteiro_id]["historico"]
+    if not hist:
+        raise HTTPException(status_code=404, detail="Aguardando primeira leitura")
+    return hist[-1]
+
+@app.get("/api/v1/telemetria/historico/{canteiro_id}")
+def historico(canteiro_id: int):
+    if canteiro_id not in estado:
+        raise HTTPException(status_code=404, detail="Canteiro não encontrado")
+    return estado[canteiro_id]["historico"]
