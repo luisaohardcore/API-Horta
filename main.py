@@ -48,7 +48,7 @@ CANTEIROS = [
 ]
 
 estado = {
-    c["id"]: {"historico": [], "bomba_ativa": False}
+    c["id"]: {"historico": [], "bomba_ativa": False, "leituras_bomba": 0}
     for c in CANTEIROS
 }
 
@@ -225,6 +225,64 @@ async def inserir_leitura(leitura: dict):
             )
 
 # -------------------------------------------------------
+# ALERTAS
+# -------------------------------------------------------
+LIMITES = {
+    "temperatura":  {"max": 33.0,  "severidade": "WARNING"},
+    "umidade_solo": {"min": 45.0,  "severidade": "CRITICAL"},
+    "ph_solo":      {"min": 5.8, "max": 7.2, "severidade": "WARNING"},
+}
+
+async def inserir_alerta(canteiro_id: int, campo: str, valor: float,
+                         severidade: str, mensagem: str, dt: datetime):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """INSERT INTO alertas
+                    (timestamp, canteiro_id, campo, valor, severidade, mensagem)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (dt, canteiro_id, campo, valor, severidade, mensagem),
+            )
+
+async def verificar_alertas(canteiro_id: int, leitura: dict, dt: datetime):
+    s = estado[canteiro_id]
+
+    # Thresholds dos sensores
+    for campo, limites in LIMITES.items():
+        valor = leitura[campo if campo != "ph_solo" else "PH_solo"]
+        if "max" in limites and valor > limites["max"]:
+            await inserir_alerta(
+                canteiro_id, campo, valor, limites["severidade"],
+                f"{campo} acima do limite: {valor}", dt
+            )
+        if "min" in limites and valor < limites["min"]:
+            await inserir_alerta(
+                canteiro_id, campo, valor, limites["severidade"],
+                f"{campo} abaixo do limite: {valor}", dt
+            )
+
+    # Luminosidade zero durante o dia (possível falha de sensor)
+    hora = dt.hour
+    if 8 <= hora <= 17 and leitura["luminosidade"] < 10.0:
+        await inserir_alerta(
+            canteiro_id, "luminosidade", leitura["luminosidade"],
+            "WARNING", "Luminosidade zero durante o dia — possível falha de sensor", dt
+        )
+
+    # Bomba ligada por mais de 10 leituras consecutivas sem efeito
+    if s["bomba_ativa"]:
+        s["leituras_bomba"] += 1
+        if s["leituras_bomba"] > 10:
+            await inserir_alerta(
+                canteiro_id, "status_bomba", 1,
+                "CRITICAL", "Bomba ativa por mais de 10 leituras sem recuperar umidade", dt
+            )
+    else:
+        s["leituras_bomba"] = 0
+
+# -------------------------------------------------------
 # LOOP POR CANTEIRO
 # -------------------------------------------------------
 async def emulador_canteiro(canteiro_id: int):
@@ -238,6 +296,7 @@ async def emulador_canteiro(canteiro_id: int):
         hist    = estado[canteiro_id]["historico"]
         hist.append(leitura)
         await inserir_leitura(leitura)
+        await verificar_alertas(canteiro_id, leitura, datetime.now(FUSO_BR).replace(tzinfo=None))
         if len(hist) > 1000:
             hist.pop(0)
 
@@ -286,7 +345,7 @@ async def criar_canteiro(body: CanteiroCriar):
                 )
 
     CANTEIROS.append(canteiro)
-    estado[novo_id] = {"historico": [], "bomba_ativa": False}
+    estado[novo_id] = {"historico": [], "bomba_ativa": False, "leituras_bomba": 0}
     asyncio.create_task(emulador_canteiro(novo_id))
     return canteiro
 
@@ -327,3 +386,38 @@ def historico(canteiro_id: int):
     if canteiro_id not in estado:
         raise HTTPException(status_code=404, detail="Canteiro não encontrado")
     return estado[canteiro_id]["historico"]
+
+@app.get("/api/v1/alertas")
+async def listar_alertas(resolvido: int = 0):
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Banco indisponível")
+    async with db_pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM alertas WHERE resolvido = %s ORDER BY timestamp DESC LIMIT 100",
+                (resolvido,)
+            )
+            return await cur.fetchall()
+
+@app.get("/api/v1/alertas/{canteiro_id}")
+async def alertas_canteiro(canteiro_id: int, resolvido: int = 0):
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Banco indisponível")
+    async with db_pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM alertas WHERE canteiro_id = %s AND resolvido = %s ORDER BY timestamp DESC",
+                (canteiro_id, resolvido)
+            )
+            return await cur.fetchall()
+
+@app.patch("/api/v1/alertas/{alerta_id}/resolver")
+async def resolver_alerta(alerta_id: int):
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Banco indisponível")
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE alertas SET resolvido = 1 WHERE id = %s", (alerta_id,)
+            )
+    return {"id": alerta_id, "resolvido": True}
