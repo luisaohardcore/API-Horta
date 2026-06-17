@@ -48,7 +48,7 @@ CANTEIROS = [
 ]
 
 estado = {
-    c["id"]: {"historico": [], "bomba_ativa": False, "leituras_bomba": 0}
+    c["id"]: {"historico": [], "bomba_ativa": False, "leituras_bomba": 0, "violacoes_ativas": set()}
     for c in CANTEIROS
 }
 
@@ -247,40 +247,47 @@ async def inserir_alerta(canteiro_id: int, campo: str, valor: float,
             )
 
 async def verificar_alertas(canteiro_id: int, leitura: dict, dt: datetime):
-    s = estado[canteiro_id]
+    s         = estado[canteiro_id]
+    violacoes = s["violacoes_ativas"]
 
-    # Thresholds dos sensores
+    # Thresholds dos sensores — alerta só na transição OK → VIOLAÇÃO
     for campo, limites in LIMITES.items():
-        valor = leitura[campo if campo != "ph_solo" else "PH_solo"]
-        if "max" in limites and valor > limites["max"]:
-            await inserir_alerta(
-                canteiro_id, campo, valor, limites["severidade"],
-                f"{campo} acima do limite: {valor}", dt
-            )
-        if "min" in limites and valor < limites["min"]:
-            await inserir_alerta(
-                canteiro_id, campo, valor, limites["severidade"],
-                f"{campo} abaixo do limite: {valor}", dt
-            )
-
-    # Luminosidade zero durante o dia (possível falha de sensor)
-    hora = dt.hour
-    if 8 <= hora <= 17 and leitura["luminosidade"] < 10.0:
-        await inserir_alerta(
-            canteiro_id, "luminosidade", leitura["luminosidade"],
-            "WARNING", "Luminosidade zero durante o dia — possível falha de sensor", dt
+        valor      = leitura[campo if campo != "ph_solo" else "PH_solo"]
+        em_violacao = (
+            ("max" in limites and valor > limites["max"]) or
+            ("min" in limites and valor < limites["min"])
         )
+        if em_violacao and campo not in violacoes:
+            violacoes.add(campo)
+            msg = (f"{campo} acima do limite: {valor}"
+                   if "max" in limites and valor > limites["max"]
+                   else f"{campo} abaixo do limite: {valor}")
+            await inserir_alerta(canteiro_id, campo, valor, limites["severidade"], msg, dt)
+        elif not em_violacao:
+            violacoes.discard(campo)
 
-    # Bomba ligada por mais de 10 leituras consecutivas sem efeito
+    # Luminosidade zero durante o dia
+    hora = dt.hour
+    chave_lux = "luminosidade_falha"
+    if 8 <= hora <= 17 and leitura["luminosidade"] < 10.0:
+        if chave_lux not in violacoes:
+            violacoes.add(chave_lux)
+            await inserir_alerta(canteiro_id, "luminosidade", leitura["luminosidade"],
+                                 "WARNING", "Luminosidade zero durante o dia — possível falha de sensor", dt)
+    else:
+        violacoes.discard(chave_lux)
+
+    # Bomba ligada por mais de 10 leituras sem efeito
+    chave_bomba = "bomba_travada"
     if s["bomba_ativa"]:
         s["leituras_bomba"] += 1
-        if s["leituras_bomba"] > 10:
-            await inserir_alerta(
-                canteiro_id, "status_bomba", 1,
-                "CRITICAL", "Bomba ativa por mais de 10 leituras sem recuperar umidade", dt
-            )
+        if s["leituras_bomba"] > 10 and chave_bomba not in violacoes:
+            violacoes.add(chave_bomba)
+            await inserir_alerta(canteiro_id, "status_bomba", 1, "CRITICAL",
+                                 "Bomba ativa por mais de 10 leituras sem recuperar umidade", dt)
     else:
         s["leituras_bomba"] = 0
+        violacoes.discard(chave_bomba)
 
 # -------------------------------------------------------
 # LOOP POR CANTEIRO
@@ -345,7 +352,7 @@ async def criar_canteiro(body: CanteiroCriar):
                 )
 
     CANTEIROS.append(canteiro)
-    estado[novo_id] = {"historico": [], "bomba_ativa": False, "leituras_bomba": 0}
+    estado[novo_id] = {"historico": [], "bomba_ativa": False, "leituras_bomba": 0, "violacoes_ativas": set()}
     asyncio.create_task(emulador_canteiro(novo_id))
     return canteiro
 
